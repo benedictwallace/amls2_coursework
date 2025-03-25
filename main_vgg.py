@@ -51,7 +51,6 @@ def build_generator(input_shape, res_blocks):
     return model
 
 
-
 def residual_block(initial):
     res = layers.Conv2D(64, (3,3), padding="same")(initial)
     res = layers.BatchNormalization(momentum=0.5)(res)
@@ -188,7 +187,7 @@ hr_shape = (256, 256, 3)
 
 generator = build_generator(res_blocks=8, input_shape=lr_shape)
 
-generator.load_weights("generator_pretrained.keras")
+generator.load_weights("generator_pretrained.weights.h5")
 
 discriminator = build_discriminator(hr_shape)
 
@@ -215,26 +214,20 @@ def train_step(lr_imgs, hr_imgs, lambda_vgg=1.0):
     # ---------------
     # Train Discriminator
     # ---------------
-    # (a) Generate fake images
+
     with tf.GradientTape() as tape_d:
         fake_imgs = generator(lr_imgs, training=True)
         
-        # Labeling:
-        #   real -> ones
-        #   fake -> zeros
         real_labels = tf.ones((batch_size,1), dtype=tf.float32)
         fake_labels = tf.zeros((batch_size,1), dtype=tf.float32)
         
-        # (b) Discriminator outputs
         d_real = discriminator(hr_imgs, training=True)
         d_fake = discriminator(fake_imgs, training=True)
-        
-        # (c) Loss for D = average of real/fake BCE
+
         d_loss_real = bce(real_labels, d_real)
         d_loss_fake = bce(fake_labels, d_fake)
         d_loss = (d_loss_real + d_loss_fake) * 0.5
         
-    # (d) Update D
     grads_d = tape_d.gradient(d_loss, discriminator.trainable_variables)
     opt_d.apply_gradients(zip(grads_d, discriminator.trainable_variables))
     
@@ -261,7 +254,7 @@ def train_step(lr_imgs, hr_imgs, lambda_vgg=1.0):
     return d_loss, g_loss
 
 # Now run an epoch loop
-epochs = 5
+epochs = 100
 
 for epoch in range(epochs):
     g_losses = []
@@ -279,9 +272,7 @@ for epoch in range(epochs):
           f"[D loss: {np.mean(d_losses):.4f}] "
           f"[G loss: {np.mean(g_losses):.4f}]")
 
-        # ----- Save a sample image after each epoch -----
-    # Here, we just use the first image from the original loaded set
-    # You can choose any index or random sample
+
     sample_lr_img = lr_cropped_images[0]  # shape [H, W, 3]
     sample_hr_img = hr_cropped_images[0]  # shape [H, W, 3]
     
@@ -301,18 +292,19 @@ for epoch in range(epochs):
     out_path = f"amls2_coursework/datasets/training_samples/sample_epoch_{epoch+1}.png"
     plt.imsave(out_path, combined_img)
 
+generator.save_weights("generator_vgg.weights.h5")
 
-sample_lr_img = lr_cropped_images[0] 
-sample_hr_img = hr_cropped_images[0]
+# sample_lr_img = lr_cropped_images[0] 
+# sample_hr_img = hr_cropped_images[0]
 
-input_lr = np.expand_dims(sample_lr_img, axis=0)
-upscaled_img = generator.predict(input_lr)
-upscaled_img = np.squeeze(upscaled_img, axis=0)
+# input_lr = np.expand_dims(sample_lr_img, axis=0)
+# upscaled_img = generator.predict(input_lr)
+# upscaled_img = np.squeeze(upscaled_img, axis=0)
 
-resized_lr = tf.image.resize(sample_lr_img, (256, 256)).numpy()
-combined_img = np.concatenate([resized_lr, upscaled_img, sample_hr_img], axis=1)
+# resized_lr = tf.image.resize(sample_lr_img, (256, 256)).numpy()
+# combined_img = np.concatenate([resized_lr, upscaled_img, sample_hr_img], axis=1)
 
-plt.figure()
-plt.imshow(combined_img)
-plt.title("Left: LR resized | Middle: SRGAN Output | Right: Original HR")
-plt.show()
+# plt.figure()
+# plt.imshow(combined_img)
+# plt.title("Left: LR resized | Middle: SRGAN Output | Right: Original HR")
+# plt.show()
