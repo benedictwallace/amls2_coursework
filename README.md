@@ -13,3 +13,5 @@ main_vgg_B.py is just the GAN phase for track 2.
 display_model.py contains the code to stitch patches together and run them through the models, be careful with the scales when changing tracks.
 
 The datasets need to be imported to the /datasets folder from https://data.vision.ee.ethz.ch/cvl/DIV2K/
+
+Apologies for the bad formatting and lack of datasets, I had some issues with git last minute.
