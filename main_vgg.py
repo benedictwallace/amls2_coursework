@@ -5,306 +5,179 @@ from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
 from keras import backend as K
+import csv
+import random
+from model import SRGANTrainer, build_discriminator, build_generator, build_vgg_for_content_loss
+from fetch_and_crop import crop_patch_pairs, create_batches
 
-def build_discriminator(in_shape):
-    model = Sequential()
-    model.add(layers.Conv2D(128, (3,3), strides=(2,2), padding="same", input_shape=in_shape))
-    model.add(layers.LeakyReLU(alpha=0.2))
+# -----------------------------
+# Create random crops for training data.
+n_random_crops_train = 15  # number of crops per training image pair
 
-    model.add(layers.Conv2D(128, (3,3), strides=(2,2), padding="same"))
-    model.add(layers.LeakyReLU(alpha=0.2))
+n_random_crops_val = 2  # number of crops per validation image pair
 
-    model.add(layers.Flatten())
-    model.add(layers.Dropout(rate=0.5))
-    model.add(layers.Dense(1, activation="sigmoid"))
+train_lr_cropped, train_hr_cropped, val_lr_cropped, val_hr_cropped = crop_patch_pairs(n_random_crops_train, n_random_crops_val)
 
-    opt = optimizers.Adam(learning_rate=0.001, beta_1=0.5)
-    model.compile(loss="binary_crossentropy", optimizer=opt, metrics=["accuracy"])
+# -----------------------------
+# Create batches from the cropped patches.
+batch_size = 16
 
-    return model
-
-
-def build_generator(input_shape, res_blocks):
-    
-    gen_in = layers.Input(shape=input_shape)
-
-    gen = layers.Conv2D(64, (9,9), padding="same")(gen_in)
-    gen = layers.PReLU(shared_axes=[1,2])(gen)
-
-    temp = gen
-
-    for i in range(0, res_blocks):
-        gen = residual_block(gen)
-
-    gen = layers.Conv2D(64, (3,3), padding="same")(gen)
-    gen = layers.BatchNormalization(momentum=0.5)(gen)
-    gen = layers.add([gen, temp])
-
-    gen = upscale(gen)
-    gen = upscale(gen)
-    gen = upscale(gen)
-
-    op = layers.Conv2D(3, (9,9), padding="same", activation="sigmoid")(gen)
-
-    model = Model(inputs=gen_in, outputs=op)
-
-    return model
-
-
-def residual_block(initial):
-    res = layers.Conv2D(64, (3,3), padding="same")(initial)
-    res = layers.BatchNormalization(momentum=0.5)(res)
-    res = layers.PReLU(shared_axes = [1,2])(res)
-    res = layers.Conv2D(64, (3,3), padding="same")(res)
-    res = layers.BatchNormalization(momentum=0.5)(res)
-
-    return layers.add([initial, res])
-
-def upscale(initial):
-    up_model = layers.Conv2D(256, (3,3), padding="same")(initial)
-    up_model = layers.UpSampling2D(size=2)(up_model)
-    up_model = layers.PReLU(shared_axes=[1,2])(up_model)
-
-    return up_model
-
-def build_vgg_for_content_loss():
-    """
-    Loads VGG19, and outputs feature maps from a chosen convolutional layer.
-    Typically block5_conv4 is used for perceptual loss in SRGAN.
-    """
-    vgg = applications.VGG19(weights='imagenet', include_top=False)
-    
-    # Pick a layer to extract features from. 
-    # For example, 'block5_conv4' is near the end of VGG19
-    # (feel free to experiment with other layers).
-    chosen_layer = 'block5_conv4'
-    
-    # Create a model that outputs the feature maps of that layer.
-    vgg_model = Model(inputs=vgg.input, 
-                      outputs=vgg.get_layer(chosen_layer).output)
-    
-    # We don’t want to train VGG19’s weights!
-    vgg_model.trainable = False
-    
-    return vgg_model
-
-
-
-def vgg_content_loss(vgg_extractor, hr, sr):
-    hr_proc = preprocess_for_vgg(hr)
-    sr_proc = preprocess_for_vgg(sr)
-    hr_features = vgg_extractor(hr_proc)
-    sr_features = vgg_extractor(sr_proc)
-    return tf.reduce_mean(tf.square(hr_features - sr_features))
-
-
-
-def build_gan_simple(generator, discriminator, lr_shape):
-    """
-    Build a combined model that stacks generator and discriminator
-    for adversarial training. 
-    """
-    discriminator.trainable = False
-    
-    # Low-resolution input
-    input_lr = layers.Input(shape=lr_shape)
-    
-    # Generate super-res output
-    gen_hr = generator(input_lr)
-    
-    # Discriminator result on fake images
-    validity = discriminator(gen_hr)
-
-    # Combined model: Low-resolution -> (Generator -> Discriminator)
-    gan_model = Model(inputs=input_lr, outputs=validity)
-
-    opt = optimizers.Adam(learning_rate=0.001, beta_1=0.5)
-    gan_model.compile(loss="binary_crossentropy", optimizer=opt)
-    return gan_model
-
-def preprocess_for_vgg(img):
-    # img in [0,1]
-    img = img * 255.0  # back to [0,255]
-    img = tf.keras.applications.vgg19.preprocess_input(img)  
-    return img
-
-# Paths to your cropped directories
-lr_cropped_dir = "amls2_coursework/datasets/DIV2K_train_LR_cropped"
-hr_cropped_dir = "amls2_coursework/datasets/DIV2K_train_HR_cropped"
-
-# Get list of file names
-lr_cropped_files = sorted(os.listdir(lr_cropped_dir))
-hr_cropped_files = sorted(os.listdir(hr_cropped_dir))
-
-# Lists to store the loaded images
-lr_cropped_images = []
-hr_cropped_images = []
-
-# Read each PNG, decode, and convert to float32 in [0,1]
-for lr_file, hr_file in zip(lr_cropped_files, hr_cropped_files):
-    lr_path = os.path.join(lr_cropped_dir, lr_file)
-    hr_path = os.path.join(hr_cropped_dir, hr_file)
-
-    # Read LR image
-    lr_img = tf.io.read_file(lr_path)
-    lr_img = tf.image.decode_png(lr_img, channels=3)
-    lr_img = tf.image.convert_image_dtype(lr_img, tf.float32)  # now in [0,1]
-
-    # Read HR image
-    hr_img = tf.io.read_file(hr_path)
-    hr_img = tf.image.decode_png(hr_img, channels=3)
-    hr_img = tf.image.convert_image_dtype(hr_img, tf.float32)  # now in [0,1]
-
-    lr_cropped_images.append(lr_img)
-    hr_cropped_images.append(hr_img)
-
-
-# Now create batches
-batch_size = 8
-
-train_lr_batches = []
-train_hr_batches = []
-
-for i in range(0, len(lr_cropped_images), batch_size):
-    # Slice out a batch of LR / HR patches
-    lr_batch = lr_cropped_images[i : i + batch_size]
-    hr_batch = hr_cropped_images[i : i + batch_size]
-
-    # Stack them into (batch_size, H, W, 3)
-    lr_batch = np.stack(lr_batch, axis=0)
-    hr_batch = np.stack(hr_batch, axis=0)
-    
-    train_lr_batches.append(lr_batch)
-    train_hr_batches.append(hr_batch)
-
-print("Number of batches:", len(train_lr_batches))
-print("Shape of first LR batch:", train_lr_batches[0].shape)
-print("Shape of first HR batch:", train_hr_batches[0].shape)
+#train_lr_batches, train_hr_batches = create_batches(train_lr_cropped, train_hr_cropped, batch_size)
+val_lr_batches, val_hr_batches = create_batches(val_lr_cropped, val_hr_cropped, batch_size)
 
 lr_shape = (32, 32, 3)
 
 hr_shape = (256, 256, 3)
 
-generator = build_generator(res_blocks=8, input_shape=lr_shape)
+generator = build_generator(res_blocks=16, input_shape=lr_shape, final_activation="sigmoid")
 
 generator.load_weights("generator_pretrained.weights.h5")
 
 discriminator = build_discriminator(hr_shape)
 
-#gan_model = build_gan_simple(generator, discriminator, lr_shape)
-
 vgg_extractor = build_vgg_for_content_loss()
 
-# 3. Create optimizers for G and D 
-opt_g = tf.keras.optimizers.Adam(learning_rate=0.0001, beta_1=0.5)
-opt_d = tf.keras.optimizers.Adam(learning_rate=0.0001, beta_1=0.5)
+sr_trainer = SRGANTrainer(
+    generator,
+    discriminator,
+    vgg_extractor,
+    lr=1e-4,
+    beta_1=0.5,
+    lambda_adv=1e-3,  # Weight of adversarial
+    lambda_vgg=0.5,  # Weight of VGG content
+    lambda_mse=1   # Weight of MSE
+)
 
-
-# 4. A helpful function for adversarial label-based BCE
-bce = tf.keras.losses.BinaryCrossentropy()
-
-@tf.function
-def train_step(lr_imgs, hr_imgs, lambda_vgg=1.0):
-    """
-    One training step for both generator and discriminator,
-    returning d_loss and g_loss.
-    """
-    batch_size = tf.shape(lr_imgs)[0]
-    
-    # ---------------
-    # Train Discriminator
-    # ---------------
-
-    with tf.GradientTape() as tape_d:
-        fake_imgs = generator(lr_imgs, training=True)
-        
-        real_labels = tf.ones((batch_size,1), dtype=tf.float32)
-        fake_labels = tf.zeros((batch_size,1), dtype=tf.float32)
-        
-        d_real = discriminator(hr_imgs, training=True)
-        d_fake = discriminator(fake_imgs, training=True)
-
-        d_loss_real = bce(real_labels, d_real)
-        d_loss_fake = bce(fake_labels, d_fake)
-        d_loss = (d_loss_real + d_loss_fake) * 0.5
-        
-    grads_d = tape_d.gradient(d_loss, discriminator.trainable_variables)
-    opt_d.apply_gradients(zip(grads_d, discriminator.trainable_variables))
-    
-    # ---------------
-    # Train Generator
-    # ---------------
-    with tf.GradientTape() as tape_g:
-        fake_imgs = generator(lr_imgs, training=True)
-        
-        # (a) adversarial loss (wants D(fake)=1)
-        d_fake_for_g = discriminator(fake_imgs, training=False)
-        adv_loss = bce(tf.ones((batch_size,1)), d_fake_for_g)
-        
-        # (b) VGG content loss
-        content_loss = vgg_content_loss(vgg_extractor, hr_imgs, fake_imgs)
-        
-        # (c) total generator loss
-        g_loss = adv_loss + lambda_vgg * content_loss
-    
-    # (d) Update G
-    grads_g = tape_g.gradient(g_loss, generator.trainable_variables)
-    opt_g.apply_gradients(zip(grads_g, generator.trainable_variables))
-
-    return d_loss, g_loss
 
 # Now run an epoch loop
-epochs = 100
+epochs = 30
+
+train_loss_history = []
+val_loss_history = []
 
 for epoch in range(epochs):
+    # Shuffle
+    combined = list(zip(train_lr_cropped, train_hr_cropped))
+    random.shuffle(combined)
+    # Unzip the list back into LR / HR arrays
+    train_lr_cropped_shuffled, train_hr_cropped_shuffled = zip(*combined)
+
+    # Rebatch
+    train_lr_batches, train_hr_batches = create_batches(
+        train_lr_cropped_shuffled, 
+        train_hr_cropped_shuffled, 
+        batch_size
+    )
+
     g_losses = []
     d_losses = []
-    
+    adv_losses = []
+    content_losses = [] 
+    mse_losses = []
+
+    if epoch == 10:
+        
+        sr_trainer.lambda_adv = 5e-3
+        print("Changed adversarial to 0.005")
+
+    if epoch == 20:
+        sr_trainer.opt_g.learning_rate.assign(5e-5)
+        sr_trainer.lambda_adv = 0.01
+        print("Changed adversarial loss to 0.01")
+
     for b in tqdm(range(len(train_hr_batches))):
         lr_imgs = train_lr_batches[b]
         hr_imgs = train_hr_batches[b]
         
-        d_loss, g_loss = train_step(lr_imgs, hr_imgs, lambda_vgg=1.0)
+        d_loss, g_loss, adv_loss, content_loss, mse_loss = sr_trainer.train_step(lr_imgs, hr_imgs)
         g_losses.append(g_loss.numpy())
         d_losses.append(d_loss.numpy())
-    
-    print(f"Epoch {epoch+1}/{epochs} "
-          f"[D loss: {np.mean(d_losses):.4f}] "
-          f"[G loss: {np.mean(g_losses):.4f}]")
+        adv_losses.append(adv_loss.numpy())
+        content_losses.append(content_loss.numpy())
+        mse_losses.append(mse_loss.numpy())
+
+    train_d_mean = np.mean(d_losses)
+    train_g_mean = np.mean(g_losses)
+    train_adv_mean = np.mean(adv_losses)
+    train_vgg_mean = np.mean(content_losses)
+    train_mse_mean = np.mean(mse_losses)
 
 
-    sample_lr_img = lr_cropped_images[0]  # shape [H, W, 3]
-    sample_hr_img = hr_cropped_images[0]  # shape [H, W, 3]
-    
-    # Create batch dimension
-    input_lr = np.expand_dims(sample_lr_img, axis=0)
-    # Generate SR image
-    upscaled_img = generator.predict(input_lr)
-    upscaled_img = np.squeeze(upscaled_img, axis=0)  # remove batch dimension
+    train_loss_history.append((train_d_mean, train_g_mean, train_adv_mean, train_vgg_mean, train_mse_mean))
 
-    # Resize LR for visual comparison
-    resized_lr = tf.image.resize(sample_lr_img, (256, 256)).numpy()
+    val_d_losses = []
+    val_g_losses = []
+    val_adv_losses = []
+    val_vgg_losses = []
+    val_mse_losses = []
 
-    # Concatenate side-by-side: [resized LR | SR result | original HR]
-    combined_img = np.concatenate([resized_lr, upscaled_img, sample_hr_img], axis=1)
+    for b in range(len(val_hr_batches)):
+        lr_imgs_val = val_lr_batches[b]
+        hr_imgs_val = val_hr_batches[b]
+        
+        d_loss_val, g_loss_val, adv_loss_val, content_loss_val, mse_loss_val = sr_trainer.val_step(lr_imgs_val, hr_imgs_val)
 
-    # Save the combined image
-    out_path = f"amls2_coursework/datasets/training_samples/sample_epoch_{epoch+1}.png"
-    plt.imsave(out_path, combined_img)
+        val_d_losses.append(d_loss_val.numpy())
+        val_g_losses.append(g_loss_val.numpy())
+        val_adv_losses.append(adv_loss_val.numpy())
+        val_vgg_losses.append(content_loss_val.numpy())
+        val_mse_losses.append(mse_loss_val.numpy())
+
+    # Compute mean validation losses for the epoch
+    val_d_mean = np.mean(val_d_losses)
+    val_g_mean = np.mean(val_g_losses)
+    val_adv_mean = np.mean(val_adv_losses)
+    val_vgg_mean = np.mean(val_vgg_losses)
+    val_mse_mean = np.mean(val_mse_losses)
+
+    val_loss_history.append((val_d_mean, val_g_mean, val_adv_mean, val_vgg_mean, val_mse_mean))
+
+    print(
+        f"Epoch {epoch+1}/{epochs} "
+        f"Train => D: {train_d_mean:.4f}, Adv: {train_adv_mean:.4f}, "
+        f"VGG: {train_vgg_mean:.4f}, MSE: {train_mse_mean:.4f}, G: {train_g_mean:.4f} || "
+        f"Val => D: {val_d_mean:.4f}, Adv: {val_adv_mean:.4f}, "
+        f"VGG: {val_vgg_mean:.4f}, MSE: {val_mse_mean:.4f}, G: {val_g_mean:.4f}"
+    )
+
 
 generator.save_weights("generator_vgg.weights.h5")
 
-# sample_lr_img = lr_cropped_images[0] 
-# sample_hr_img = hr_cropped_images[0]
+# Extract the separate losses from your history
+train_adv = [t[2] for t in train_loss_history]  # Adversarial loss is the 3rd element
+train_vgg = [t[3] for t in train_loss_history]  # VGG/content loss is the 4th element
+train_mse = [t[4] for t in train_loss_history]  # MSE is the 5th element
 
-# input_lr = np.expand_dims(sample_lr_img, axis=0)
-# upscaled_img = generator.predict(input_lr)
-# upscaled_img = np.squeeze(upscaled_img, axis=0)
+val_adv = [v[2] for v in val_loss_history]
+val_vgg = [v[3] for v in val_loss_history]
+val_mse = [v[4] for v in val_loss_history]
 
-# resized_lr = tf.image.resize(sample_lr_img, (256, 256)).numpy()
-# combined_img = np.concatenate([resized_lr, upscaled_img, sample_hr_img], axis=1)
+# Create a figure with 3 subplots (one per loss type)
+fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(15,5))
 
-# plt.figure()
-# plt.imshow(combined_img)
-# plt.title("Left: LR resized | Middle: SRGAN Output | Right: Original HR")
-# plt.show()
+# 1) Adversarial loss
+axes[0].plot(train_adv, label='Train Adv')
+axes[0].plot(val_adv,   label='Val Adv')
+axes[0].set_title('Adversarial Loss')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Loss')
+axes[0].legend()
+
+# 2) VGG/content loss
+axes[1].plot(train_vgg, label='Train VGG')
+axes[1].plot(val_vgg,   label='Val VGG')
+axes[1].set_title('VGG Loss')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Loss')
+axes[1].legend()
+
+# 3) MSE loss
+axes[2].plot(train_mse, label='Train MSE')
+axes[2].plot(val_mse,   label='Val MSE')
+axes[2].set_title('MSE Loss')
+axes[2].set_xlabel('Epoch')
+axes[2].set_ylabel('Loss')
+axes[2].legend()
+
+plt.tight_layout()
+plt.savefig("amls2_coursework/training_losses.png", dpi=300)
